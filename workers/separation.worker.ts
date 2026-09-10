@@ -4,18 +4,21 @@
 // compilation, and inference. It speaks a small message protocol defined
 // in lib/types.ts (WorkerInboundMessage / WorkerOutboundMessage).
 //
-// Separation approach: STFT-domain masking.
-//   1. STFT each channel of the mixed-down audio.
-//   2. Feed magnitude spectrogram chunks through the ONNX model, which
-//      predicts a vocal mask in [0, 1] per time-frequency bin.
-//   3. Apply the mask to the complex mix spectrogram -> vocal spectrogram.
-//   4. ISTFT back to a waveform for vocals.
-//   5. Instrumental = mix - vocals in the time domain (guarantees the two
-//      stems sum back to the original mix, avoiding phase artifacts from
-//      re-synthesizing the instrumental independently).
+// Separation approach: chunked complex-STFT inference, matching the
+// tensor contract used by real UVR-MDX-Net ONNX models (see
+// lib/modelConfig.ts for the full contract description and citations).
+// In short, for each ~6-second chunk of audio:
+//   1. STFT each of the L/R channels (Hann window, center-padded).
+//   2. Pack [L.re, L.im, R.re, R.im], cropped to `dimF` frequency bins,
+//      into a [1, 4, dimF, dimT] tensor and run it through the ONNX model.
+//   3. The model predicts the complex STFT of its "primary" stem directly
+//      (this is a real neural network prediction — not an EQ/phase trick).
+//   4. Zero-pad the frequency axis back out and ISTFT to get a waveform,
+//      trimming the STFT context margin used for each chunk.
+//   5. The non-primary stem = mix − primary in the time domain, which
+//      guarantees the two stems always sum back to the original mix.
 //
-// This is genuine learned source separation (the mask comes from a neural
-// network's weights), not an EQ/phase-cancellation trick.
+// All of this runs off the main thread so the tab stays responsive.
 
 import * as ort from "onnxruntime-web";
 import { stft, istft, type StftFrames } from "../lib/stft";
@@ -53,7 +56,9 @@ ctx.addEventListener("message", async (event: MessageEvent<WorkerInboundMessage>
   }
 });
 
-function classifyError(err: any): "no-webgpu-no-wasm" | "model-download-failed" | "model-load-failed" | "out-of-memory" | "inference-failed" | "unknown" {
+function classifyError(
+  err: any
+): "no-webgpu-no-wasm" | "model-download-failed" | "model-load-failed" | "out-of-memory" | "inference-failed" | "unknown" {
   const msg = String(err?.message ?? err ?? "").toLowerCase();
   if (msg.includes("download")) return "model-download-failed";
   if (msg.includes("out of memory") || msg.includes("oom") || msg.includes("allocation failed")) return "out-of-memory";
@@ -115,57 +120,76 @@ async function handleSeparate(msg: WorkerSeparateMessage) {
   }
   const config = getModelConfig();
   const { channels, sampleRate } = msg;
+  const [mixL, mixR] = toStereo(channels);
+  const nSamples = mixL.length;
 
-  // The model expects a fixed channel count (stereo). Downmix/upmix as needed.
-  const stereo = toStereo(channels);
+  const { fftSize, hopSize, dimF, dimT, inputName, outputName, compensate, primaryStem } = config;
+  const nBins = fftSize / 2 + 1;
+  if (dimF > nBins) {
+    throw new Error(
+      `NEXT_PUBLIC_MODEL_DIM_F (${dimF}) can't exceed fftSize/2 + 1 (${nBins}). Check your model configuration.`
+    );
+  }
 
-  post({ type: "progress", stage: "processing", progress: 0, detail: "Analyzing audio" });
+  const trim = Math.floor(fftSize / 2);
+  const chunkSize = hopSize * (dimT - 1);
+  const genSize = chunkSize - 2 * trim;
+  if (genSize <= 0) {
+    throw new Error(
+      "Invalid model chunking configuration: NEXT_PUBLIC_MODEL_DIM_T is too small for the configured fftSize/hopSize."
+    );
+  }
 
-  const stftL = stft(stereo[0]!, config.fftSize, config.hopSize);
-  const stftR = stft(stereo[1]!, config.fftSize, config.hopSize);
+  const remainder = nSamples % genSize;
+  const pad = remainder === 0 ? genSize : genSize - remainder;
 
-  const dimF = config.fftSize / 2; // drop the Nyquist bin, standard MDX-style convention
-  const numFrames = stftL.real.length;
-  const chunkFrames = config.chunkFrames;
-  const numChunks = Math.max(1, Math.ceil(numFrames / chunkFrames));
+  const paddedL = padChannel(mixL, trim, pad);
+  const paddedR = padChannel(mixR, trim, pad);
 
-  const vocalMaskL: Float32Array[] = new Array(numFrames);
-  const vocalMaskR: Float32Array[] = new Array(numFrames);
+  const numChunks = (nSamples + pad) / genSize;
+
+  // Accumulates the model's predicted "primary" stem waveform.
+  const primaryL = new Float32Array(nSamples + pad);
+  const primaryR = new Float32Array(nSamples + pad);
+
+  post({ type: "progress", stage: "processing", progress: 0, detail: "Separating vocals" });
 
   for (let c = 0; c < numChunks; c++) {
-    const startFrame = c * chunkFrames;
-    const endFrame = Math.min(numFrames, startFrame + chunkFrames);
-    const framesInChunk = endFrame - startFrame;
+    const start = c * genSize;
 
-    const inputData = new Float32Array(1 * 2 * dimF * chunkFrames);
-    fillMagnitudeChunk(inputData, stftL, startFrame, framesInChunk, dimF, chunkFrames, 0);
-    fillMagnitudeChunk(inputData, stftR, startFrame, framesInChunk, dimF, chunkFrames, 1);
+    const chunkL = extractChunk(paddedL, start, chunkSize);
+    const chunkR = extractChunk(paddedR, start, chunkSize);
 
-    const tensor = new ort.Tensor("float32", inputData, [1, 2, dimF, chunkFrames]);
-    const feeds: Record<string, ort.Tensor> = { [config.inputName]: tensor };
+    const framesL = stft(chunkL, fftSize, hopSize);
+    const framesR = stft(chunkR, fftSize, hopSize);
 
-    const outputMap = await session.run(feeds);
-    const output = outputMap[config.outputName];
-    if (!output) {
-      throw new Error(
-        `Model did not return an output named "${config.outputName}". Check NEXT_PUBLIC_MODEL_OUTPUT_NAME.`
-      );
+    const inputData = new Float32Array(4 * dimF * dimT);
+    packComplexChannel(inputData, framesL, 0, dimF, dimT);
+    packComplexChannel(inputData, framesR, 2, dimF, dimT);
+
+    const tensor = new ort.Tensor("float32", inputData, [1, 4, dimF, dimT]);
+    const outputMap = await session.run({ [inputName]: tensor });
+    const outTensor =
+      (outputName && outputMap[outputName]) || outputMap[Object.keys(outputMap)[0]!];
+    if (!outTensor) {
+      throw new Error("The model did not return any output tensor.");
     }
-    const outData = output.data as Float32Array;
+    const outData = outTensor.data as Float32Array;
 
-    for (let f = 0; f < framesInChunk; f++) {
-      const frameIdx = startFrame + f;
-      const maskL = new Float32Array(dimF);
-      const maskR = new Float32Array(dimF);
-      for (let bin = 0; bin < dimF; bin++) {
-        // Layout: [batch, channel(2), freq(dimF), time(chunkFrames)]
-        const idxL = (0 * dimF + bin) * chunkFrames + f;
-        const idxR = (1 * dimF + bin) * chunkFrames + f;
-        maskL[bin] = clamp01(outData[idxL]!);
-        maskR[bin] = clamp01(outData[idxR]!);
-      }
-      vocalMaskL[frameIdx] = maskL;
-      vocalMaskR[frameIdx] = maskR;
+    const primaryFramesL = unpackComplexChannel(outData, 0, dimF, dimT, nBins, fftSize, hopSize, chunkSize);
+    const primaryFramesR = unpackComplexChannel(outData, 2, dimF, dimT, nBins, fftSize, hopSize, chunkSize);
+
+    const chunkPrimaryL = istft(primaryFramesL);
+    const chunkPrimaryR = istft(primaryFramesR);
+
+    // Trim the STFT context margin from each chunk's output, then place it
+    // at its stride position — chunks were spaced by `genSize`, so the
+    // trimmed regions tile perfectly with no overlap and no gaps.
+    for (let k = 0; k < genSize; k++) {
+      const dst = start + k;
+      if (dst >= primaryL.length) break;
+      primaryL[dst] = chunkPrimaryL[trim + k]! * compensate;
+      primaryR[dst] = chunkPrimaryR[trim + k]! * compensate;
     }
 
     post({
@@ -176,72 +200,91 @@ async function handleSeparate(msg: WorkerSeparateMessage) {
     });
   }
 
-  const vocalStftL = applyMask(stftL, vocalMaskL, dimF);
-  const vocalStftR = applyMask(stftR, vocalMaskR, dimF);
+  const finalPrimaryL = primaryL.subarray(0, nSamples);
+  const finalPrimaryR = primaryR.subarray(0, nSamples);
 
-  post({ type: "progress", stage: "processing", progress: null, detail: "Reconstructing audio" });
-
-  const vocalsL = istft(vocalStftL);
-  const vocalsR = istft(vocalStftR);
-
-  const instrumentalL = new Float32Array(stereo[0]!.length);
-  const instrumentalR = new Float32Array(stereo[1]!.length);
-  for (let i = 0; i < instrumentalL.length; i++) {
-    instrumentalL[i] = stereo[0]![i]! - vocalsL[i]!;
-    instrumentalR[i] = stereo[1]![i]! - vocalsR[i]!;
+  let vocals: Float32Array[];
+  let instrumental: Float32Array[];
+  if (primaryStem === "vocals") {
+    vocals = [Float32Array.from(finalPrimaryL), Float32Array.from(finalPrimaryR)];
+    instrumental = [subtract(mixL, finalPrimaryL), subtract(mixR, finalPrimaryR)];
+  } else {
+    instrumental = [Float32Array.from(finalPrimaryL), Float32Array.from(finalPrimaryR)];
+    vocals = [subtract(mixL, finalPrimaryL), subtract(mixR, finalPrimaryR)];
   }
 
   post({ type: "progress", stage: "done", progress: 1 });
-  post({
-    type: "result",
-    vocals: [vocalsL, vocalsR],
-    instrumental: [instrumentalL, instrumentalR],
-    sampleRate,
-  });
+  post({ type: "result", vocals, instrumental, sampleRate });
 }
 
-function fillMagnitudeChunk(
+function padChannel(channel: Float32Array, trim: number, pad: number): Float32Array {
+  const out = new Float32Array(trim + channel.length + pad + trim);
+  out.set(channel, trim);
+  return out;
+}
+
+function extractChunk(padded: Float32Array, start: number, length: number): Float32Array {
+  const end = Math.min(padded.length, start + length);
+  const out = new Float32Array(length);
+  out.set(padded.subarray(start, end));
+  return out;
+}
+
+/** Writes [re, im] of `frames` (cropped to dimF bins) into channels [chOffset, chOffset+1] of a [4, dimF, dimT] buffer. */
+function packComplexChannel(
   target: Float32Array,
   frames: StftFrames,
-  startFrame: number,
-  framesInChunk: number,
+  chOffset: number,
   dimF: number,
-  chunkFrames: number,
-  channelIndex: number
+  dimT: number
 ) {
-  for (let f = 0; f < chunkFrames; f++) {
-    const frameIdx = startFrame + f;
+  const numFrames = Math.min(dimT, frames.real.length);
+  for (let f = 0; f < numFrames; f++) {
+    const re = frames.real[f]!;
+    const im = frames.imag[f]!;
     for (let bin = 0; bin < dimF; bin++) {
-      let mag = 0;
-      if (f < framesInChunk && frameIdx < frames.real.length) {
-        const re = frames.real[frameIdx]![bin]!;
-        const im = frames.imag[frameIdx]![bin]!;
-        mag = Math.sqrt(re * re + im * im);
-      }
-      const idx = (channelIndex * dimF + bin) * chunkFrames + f;
-      target[idx] = mag;
+      const reIdx = (chOffset * dimF + bin) * dimT + f;
+      const imIdx = ((chOffset + 1) * dimF + bin) * dimT + f;
+      target[reIdx] = bin < re.length ? re[bin]! : 0;
+      target[imIdx] = bin < im.length ? im[bin]! : 0;
     }
   }
 }
 
-function applyMask(frames: StftFrames, masks: Float32Array[], dimF: number): StftFrames {
-  const real: Float32Array[] = new Array(frames.real.length);
-  const imag: Float32Array[] = new Array(frames.imag.length);
-  for (let f = 0; f < frames.real.length; f++) {
-    const srcRe = frames.real[f]!;
-    const srcIm = frames.imag[f]!;
-    const mask = masks[f]!;
-    const outRe = new Float32Array(frames.numFreqBins);
-    const outIm = new Float32Array(frames.numFreqBins);
-    for (let bin = 0; bin < frames.numFreqBins; bin++) {
-      const m = bin < dimF ? mask[bin]! : 0; // Nyquist bin dropped by the model -> fully masked out
-      outRe[bin] = srcRe[bin]! * m;
-      outIm[bin] = srcIm[bin]! * m;
+/** Reads channels [chOffset, chOffset+1] of a [4, dimF, dimT] model output back into full-bandwidth StftFrames (zero-padding bins >= dimF). */
+function unpackComplexChannel(
+  data: Float32Array,
+  chOffset: number,
+  dimF: number,
+  dimT: number,
+  nBins: number,
+  fftSize: number,
+  hopSize: number,
+  signalLength: number
+): StftFrames {
+  const real: Float32Array[] = new Array(dimT);
+  const imag: Float32Array[] = new Array(dimT);
+  for (let f = 0; f < dimT; f++) {
+    const frameRe = new Float32Array(nBins);
+    const frameIm = new Float32Array(nBins);
+    for (let bin = 0; bin < dimF; bin++) {
+      const reIdx = (chOffset * dimF + bin) * dimT + f;
+      const imIdx = ((chOffset + 1) * dimF + bin) * dimT + f;
+      frameRe[bin] = data[reIdx]!;
+      frameIm[bin] = data[imIdx]!;
     }
-    real[f] = outRe;
-    imag[f] = outIm;
+    // Bins >= dimF are left at 0 (the model's own convention — see
+    // `freq_pad` in the reference UVR-MDX-Net implementation).
+    real[f] = frameRe;
+    imag[f] = frameIm;
   }
-  return { ...frames, real, imag };
+  return { real, imag, numFreqBins: nBins, fftSize, hopSize, signalLength };
+}
+
+function subtract(a: Float32Array, b: Float32Array): Float32Array {
+  const out = new Float32Array(a.length);
+  for (let i = 0; i < a.length; i++) out[i] = a[i]! - b[i]!;
+  return out;
 }
 
 function toStereo(channels: Float32Array[]): [Float32Array, Float32Array] {
@@ -250,11 +293,6 @@ function toStereo(channels: Float32Array[]): [Float32Array, Float32Array] {
   }
   const mono = channels[0]!;
   return [mono, mono.slice()];
-}
-
-function clamp01(x: number): number {
-  if (Number.isNaN(x)) return 0;
-  return Math.max(0, Math.min(1, x));
 }
 
 export {};
