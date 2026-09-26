@@ -117,6 +117,7 @@ export interface WorkerErrorMessage {
   code:
     | "no-webgpu-no-wasm"
     | "model-download-failed"
+    | "engine-download-failed"
     | "model-load-failed"
     | "out-of-memory"
     | "inference-failed"

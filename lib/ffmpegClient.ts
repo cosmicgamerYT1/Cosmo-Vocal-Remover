@@ -2,16 +2,35 @@ import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
 
 const FFMPEG_CORE_VERSION = "0.12.6";
-const FFMPEG_CORE_BASE = `https://unpkg.com/@ffmpeg/[email protected]${FFMPEG_CORE_VERSION}/dist/esm`;
+
+// Multiple CDN mirrors, tried in order. A single provider being blocked by
+// an ad-blocker/firewall, rate-limited, or briefly down shouldn't hard-fail
+// the whole app with an opaque "Failed to fetch".
+const FFMPEG_CORE_CDN_CANDIDATES = [
+  `https://cdn.jsdelivr.net/npm/@ffmpeg/[email protected]${FFMPEG_CORE_VERSION}/dist/esm`,
+  `https://unpkg.com/@ffmpeg/[email protected]${FFMPEG_CORE_VERSION}/dist/esm`,
+];
 
 let ffmpegInstance: FFmpeg | null = null;
 let loadPromise: Promise<FFmpeg> | null = null;
 
+class FFmpegLoadError extends Error {
+  constructor(causes: unknown[]) {
+    super(
+      "Couldn't load the video-processing engine (FFmpeg) from any available source. " +
+        "This is usually caused by an ad-blocker/privacy extension blocking cdn.jsdelivr.net or unpkg.com, " +
+        "or a network/firewall restriction. Try an incognito window with extensions disabled, or a different network."
+    );
+    this.name = "FFmpegLoadError";
+    this.cause = causes;
+  }
+}
+
 /**
  * Lazily loads ffmpeg.wasm (single-threaded core — no COOP/COEP headers
- * required, which keeps Vercel deployment configuration-free). The core
- * binary (~25MB) is fetched from a CDN and cached by the browser's HTTP
- * cache after first use.
+ * required, which keeps Vercel deployment configuration-free). Tries each
+ * CDN candidate in turn; the core binary (~25MB) is cached by the
+ * browser's HTTP cache after first successful use.
  */
 export async function getFFmpeg(onLog?: (message: string) => void): Promise<FFmpeg> {
   if (ffmpegInstance) return ffmpegInstance;
@@ -22,11 +41,23 @@ export async function getFFmpeg(onLog?: (message: string) => void): Promise<FFmp
     if (onLog) {
       ffmpeg.on("log", ({ message }) => onLog(message));
     }
-    const coreURL = await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.js`, "text/javascript");
-    const wasmURL = await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.wasm`, "application/wasm");
-    await ffmpeg.load({ coreURL, wasmURL });
-    ffmpegInstance = ffmpeg;
-    return ffmpeg;
+
+    const errors: unknown[] = [];
+    for (const base of FFMPEG_CORE_CDN_CANDIDATES) {
+      try {
+        const coreURL = await toBlobURL(`${base}/ffmpeg-core.js`, "text/javascript");
+        const wasmURL = await toBlobURL(`${base}/ffmpeg-core.wasm`, "application/wasm");
+        await ffmpeg.load({ coreURL, wasmURL });
+        ffmpegInstance = ffmpeg;
+        return ffmpeg;
+      } catch (err) {
+        errors.push(err);
+        // try the next candidate
+      }
+    }
+
+    loadPromise = null; // allow a future retry to attempt the CDNs again
+    throw new FFmpegLoadError(errors);
   })();
 
   return loadPromise;

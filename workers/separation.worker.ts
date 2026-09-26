@@ -58,9 +58,23 @@ ctx.addEventListener("message", async (event: MessageEvent<WorkerInboundMessage>
 
 function classifyError(
   err: any
-): "no-webgpu-no-wasm" | "model-download-failed" | "model-load-failed" | "out-of-memory" | "inference-failed" | "unknown" {
+):
+  | "no-webgpu-no-wasm"
+  | "model-download-failed"
+  | "engine-download-failed"
+  | "model-load-failed"
+  | "out-of-memory"
+  | "inference-failed"
+  | "unknown" {
   const msg = String(err?.message ?? err ?? "").toLowerCase();
-  if (msg.includes("download")) return "model-download-failed";
+  if (msg.includes("model download failed")) return "model-download-failed";
+  if (msg.includes("failed to fetch") || msg.includes("networkerror") || msg.includes("load failed")) {
+    // A fetch failed somewhere during setup. Since the (large) model file is
+    // fetched explicitly by fetchModelWithCache before this point, a fetch
+    // failure here is almost always ONNX Runtime's own WASM/WebGPU runtime
+    // files failing to load from the CDN — not a "browser unsupported" case.
+    return "engine-download-failed";
+  }
   if (msg.includes("out of memory") || msg.includes("oom") || msg.includes("allocation failed")) return "out-of-memory";
   if (msg.includes("webgpu") || msg.includes("wasm")) return "no-webgpu-no-wasm";
   if (msg.includes("session") || msg.includes("load")) return "model-load-failed";
@@ -68,10 +82,34 @@ function classifyError(
   return "unknown";
 }
 
+// Multiple CDN mirrors for the ONNX Runtime Web WASM/WebGPU artifacts,
+// tried in order via a lightweight reachability probe. A single provider
+// being blocked by an ad-blocker/firewall or briefly down shouldn't
+// hard-fail the whole app with an opaque "Failed to fetch".
+const ORT_WASM_CDN_CANDIDATES = [
+  "https://cdn.jsdelivr.net/npm/[email protected]/dist/",
+  "https://unpkg.com/[email protected]/dist/",
+];
+
+async function resolveOrtWasmBase(): Promise<string> {
+  for (const base of ORT_WASM_CDN_CANDIDATES) {
+    try {
+      const res = await fetch(`${base}ort-wasm-simd-threaded.wasm`, { method: "HEAD" });
+      if (res.ok) return base;
+    } catch {
+      // try the next candidate
+    }
+  }
+  // Fall back to the first candidate; if it's also unreachable, ORT's own
+  // load error will surface with a clear "wasm"/"fetch" message that
+  // classifyError() maps to a helpful, correctly-labeled error for the user.
+  return ORT_WASM_CDN_CANDIDATES[0]!;
+}
+
 async function handleInit(msg: WorkerInitMessage) {
   // Serve the ONNX Runtime Web WASM/WebGPU artifacts from a versioned CDN so
   // the Next.js bundle doesn't need custom asset copying to work on Vercel.
-  ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/[email protected]/dist/";
+  ort.env.wasm.wasmPaths = await resolveOrtWasmBase();
   ort.env.wasm.numThreads = 1; // single-threaded: no COOP/COEP headers required
   ort.env.logLevel = "warning";
 

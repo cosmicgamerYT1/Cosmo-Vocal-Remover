@@ -331,6 +331,14 @@ export default function HomePage() {
 }
 
 function mapErrorToAppError(err: unknown): AppError {
+  if (err instanceof Error && err.name === "FFmpegLoadError") {
+    return {
+      title: "Couldn't load the video engine",
+      message: err.message,
+      recoverable: true,
+    };
+  }
+
   if (err instanceof SeparationEngineError) {
     switch (err.code) {
       case "model-not-configured":
@@ -350,6 +358,13 @@ function mapErrorToAppError(err: unknown): AppError {
         return {
           title: "Couldn't download the separation model",
           message: "Check your internet connection and try again. The model only needs to download once.",
+          recoverable: true,
+        };
+      case "engine-download-failed":
+        return {
+          title: "Couldn't load the separation engine",
+          message:
+            "The browser couldn't download required inference files from cdn.jsdelivr.net or unpkg.com. This is usually an ad-blocker, privacy extension, or network/firewall restriction blocking those domains. Try an incognito window with extensions disabled, or a different network, then try again.",
           recoverable: true,
         };
       case "out-of-memory":
@@ -376,6 +391,15 @@ function mapErrorToAppError(err: unknown): AppError {
     };
   }
 
-  const message = err instanceof Error ? err.message : "An unexpected error occurred.";
-  return { title: "Something went wrong", message, recoverable: true };
+  const rawMessage = err instanceof Error ? err.message : String(err ?? "");
+  if (rawMessage.toLowerCase().includes("failed to fetch")) {
+    return {
+      title: "A network request failed",
+      message:
+        "Something the app needed to download over the network didn't load — often caused by an ad-blocker/privacy extension, or a network/firewall restriction. Try an incognito window with extensions disabled, or a different network, then try again.",
+      recoverable: true,
+    };
+  }
+
+  return { title: "Something went wrong", message: rawMessage || "An unexpected error occurred.", recoverable: true };
 }
