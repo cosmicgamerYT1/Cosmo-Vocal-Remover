@@ -386,14 +386,22 @@ this is a genuine device constraint, not a bug you can route around.
 
 **"Failed to fetch" / "Couldn't load the video engine" / "Couldn't load the separation engine"**
 The app loads FFmpeg and ONNX Runtime Web's runtime files from CDNs
-(`cdn.jsdelivr.net`, with `unpkg.com` as an automatic fallback). These
-generic-sounding errors mean one of those couldn't be reached — almost
-always an ad-blocker/privacy extension blocking the CDN domains, or a
-network/firewall restriction. Try an incognito window with extensions
-disabled, or a different network, then retry. Both subsystems now try a
-second CDN automatically before surfacing this error, so a single
-provider hiccup shouldn't be enough to trigger it — if you still see it,
-check the Network tab for which specific URL is failing (red/blocked).
+(`cdn.jsdelivr.net`, with `unpkg.com` as an automatic fallback). Two
+distinct causes produce similar-looking errors:
+- A blocked/unreachable CDN download (ad-blocker, privacy extension, or
+  network/firewall restriction) — the error message will say a file
+  "couldn't be downloaded."
+- For FFmpeg specifically: its wrapper library spawns its own internal
+  worker via a bundler-relative URL, which Next.js's webpack config
+  doesn't always resolve correctly for code inside `node_modules`. This is
+  worked around in `lib/ffmpegClient.ts` by fetching that worker script
+  explicitly from the CDN and passing it as `classWorkerURL` — if you still
+  hit a worker-related failure, the error message will say so specifically
+  rather than blaming the network.
+
+If you still see this after updating, check the Network tab for the
+specific failing request to tell which case you're in.
+
 
 
 **Model download is slow on every visit**
