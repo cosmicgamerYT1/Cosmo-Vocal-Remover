@@ -13,7 +13,7 @@ import { detectMediaKind, baseNameWithoutExtension, formatBytes, LARGE_FILE_WARN
 import { probeMediaElement, decodeAudioBuffer } from "@/lib/audioDecode";
 import { encodeWav } from "@/lib/wavEncode";
 import { runSeparation, SeparationEngineError } from "@/lib/separationEngine";
-import { extractAudioFromVideo, muxVideoWithAudio } from "@/lib/ffmpegClient";
+import { extractAudioFromVideo, muxVideoWithAudio, terminateFFmpeg } from "@/lib/ffmpegClient";
 import { getModelConfig, isModelConfigured } from "@/lib/modelConfig";
 import type {
   AppStage,
@@ -52,6 +52,7 @@ export default function HomePage() {
   const [processing, setProcessing] = useState<ProcessingState | null>(null);
   const [largeFileWarning, setLargeFileWarning] = useState<string | null>(null);
   const cancelRef = useRef<(() => void) | null>(null);
+  const cancelledRef = useRef(false);
 
   const resetToLanding = useCallback(() => {
     cancelRef.current?.();
@@ -61,6 +62,18 @@ export default function HomePage() {
     setError(null);
     setProcessing(null);
     setLargeFileWarning(null);
+  }, []);
+
+  // Stops an in-flight run (ONNX worker + FFmpeg worker) and returns to the
+  // file card with the same media still selected, so the user can retry.
+  const handleCancel = useCallback(() => {
+    cancelledRef.current = true;
+    cancelRef.current?.();
+    cancelRef.current = null;
+    terminateFFmpeg();
+    setProcessing(null);
+    setError(null);
+    setStage("landing");
   }, []);
 
   const handleFileSelected = useCallback(async (file: File) => {
@@ -241,6 +254,7 @@ export default function HomePage() {
       return;
     }
 
+    cancelledRef.current = false;
     setStage("processing");
     setProcessing({
       stepIndex: 0,
@@ -254,6 +268,7 @@ export default function HomePage() {
       setResult(outcome);
       setStage("results");
     } catch (err) {
+      if (cancelledRef.current) return; // user cancelled; errors from the aborted run are expected
       setStage("error");
       setError(mapErrorToAppError(err));
     } finally {
@@ -306,7 +321,7 @@ export default function HomePage() {
           )}
 
           {stage === "processing" && processing && media && (
-            <ProcessingScreen state={processing} fileName={media.file.name} isLocal />
+            <ProcessingScreen state={processing} fileName={media.file.name} isLocal onCancel={handleCancel} />
           )}
 
           {stage === "results" && result?.kind === "audio" && (
@@ -331,6 +346,14 @@ export default function HomePage() {
 }
 
 function mapErrorToAppError(err: unknown): AppError {
+  if (err instanceof Error && err.name === "FFmpegTimeoutError") {
+    return {
+      title: "Processing timed out",
+      message: err.message,
+      recoverable: true,
+    };
+  }
+
   if (err instanceof Error && err.name === "FFmpegLoadError") {
     return {
       title: "Couldn't load the video engine",

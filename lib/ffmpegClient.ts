@@ -66,9 +66,13 @@ export async function getFFmpeg(onLog?: (message: string) => void): Promise<FFmp
 
   loadPromise = (async () => {
     const ffmpeg = new FFmpeg();
-    if (onLog) {
-      ffmpeg.on("log", ({ message }) => onLog(message));
-    }
+    // Always surface FFmpeg's own log lines to the console — this is the
+    // single most useful signal for diagnosing a stalled/slow command,
+    // since it shows whether FFmpeg is actively working or has gone silent.
+    ffmpeg.on("log", ({ message }) => {
+      console.debug("[ffmpeg]", message);
+      onLog?.(message);
+    });
 
     const errors: unknown[] = [];
     for (let i = 0; i < FFMPEG_CORE_CDN_CANDIDATES.length; i++) {
@@ -96,6 +100,47 @@ export async function getFFmpeg(onLog?: (message: string) => void): Promise<FFmp
   return loadPromise;
 }
 
+/**
+ * Forcibly kills the FFmpeg worker and clears cached state, so the next
+ * call to getFFmpeg() starts fresh. Used both to implement "Cancel" during
+ * processing and as a recovery path if a command appears to have stalled.
+ */
+export function terminateFFmpeg(): void {
+  ffmpegInstance?.terminate();
+  ffmpegInstance = null;
+  loadPromise = null;
+}
+
+class FFmpegTimeoutError extends Error {
+  constructor(what: string, ms: number) {
+    super(
+      `${what} is taking much longer than expected (over ${Math.round(ms / 1000)}s) and may have stalled. ` +
+        "This can happen with very large/complex files, or if FFmpeg's worker got stuck. " +
+        'Try a shorter clip, or click "Cancel" and try again.'
+    );
+    this.name = "FFmpegTimeoutError";
+  }
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new FFmpegTimeoutError(what, ms)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
+const EXTRACT_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+const MUX_TIMEOUT_MS = 6 * 60 * 1000; // 6 minutes (re-encode fallback can be slow)
+
 /** Extracts the audio track from a video file as WAV bytes, for decoding/separation. */
 export async function extractAudioFromVideo(
   file: File,
@@ -105,18 +150,24 @@ export async function extractAudioFromVideo(
   const inputName = "input" + extensionOf(file.name);
   const outputName = "extracted-audio.wav";
 
-  if (onProgress) {
-    ffmpeg.on("progress", ({ progress }) => onProgress(Math.min(1, Math.max(0, progress))));
+  const progressHandler = ({ progress }: { progress: number }) =>
+    onProgress?.(Math.min(1, Math.max(0, progress)));
+  if (onProgress) ffmpeg.on("progress", progressHandler);
+
+  try {
+    await ffmpeg.writeFile(inputName, await fetchFile(file));
+    await withTimeout(
+      ffmpeg.exec(["-i", inputName, "-vn", "-acodec", "pcm_s16le", "-ar", "44100", outputName]),
+      EXTRACT_TIMEOUT_MS,
+      "Extracting audio from the video"
+    );
+    const data = await ffmpeg.readFile(outputName);
+    return data as Uint8Array;
+  } finally {
+    if (onProgress) ffmpeg.off("progress", progressHandler);
+    await ffmpeg.deleteFile(inputName).catch(() => {});
+    await ffmpeg.deleteFile(outputName).catch(() => {});
   }
-
-  await ffmpeg.writeFile(inputName, await fetchFile(file));
-  await ffmpeg.exec(["-i", inputName, "-vn", "-acodec", "pcm_s16le", "-ar", "44100", outputName]);
-  const data = await ffmpeg.readFile(outputName);
-
-  await ffmpeg.deleteFile(inputName).catch(() => {});
-  await ffmpeg.deleteFile(outputName).catch(() => {});
-
-  return data as Uint8Array;
 }
 
 /**
@@ -165,8 +216,9 @@ export async function muxVideoWithAudio(
   ];
 
   try {
-    await ffmpeg.exec(tryCopyArgs);
-  } catch {
+    await withTimeout(ffmpeg.exec(tryCopyArgs), MUX_TIMEOUT_MS, "Combining audio with video");
+  } catch (err) {
+    if (err instanceof FFmpegTimeoutError) throw err;
     // Some source codecs (e.g. certain MKV video codecs) aren't valid inside
     // an MP4 container without re-encoding. Fall back to a high-quality
     // H.264 re-encode so the output is still a fully valid, playable MP4.
@@ -197,7 +249,9 @@ export async function muxVideoWithAudio(
       "+faststart",
       outputName,
     ];
-    await ffmpeg.exec(reencodeArgs);
+    await withTimeout(ffmpeg.exec(reencodeArgs), MUX_TIMEOUT_MS, "Re-encoding video");
+  } finally {
+    if (onProgress) ffmpeg.off("progress", progressHandler);
   }
 
   const data = await ffmpeg.readFile(outputName);

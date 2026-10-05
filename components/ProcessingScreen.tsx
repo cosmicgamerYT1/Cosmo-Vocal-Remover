@@ -1,13 +1,14 @@
-import { Check, Loader2, Cpu } from "lucide-react";
+import { Check, Loader2, Cpu, X } from "lucide-react";
 import type { ProcessingState } from "@/lib/types";
 
 interface ProcessingScreenProps {
   state: ProcessingState;
   fileName: string;
   isLocal: boolean;
+  onCancel?: () => void;
 }
 
-export default function ProcessingScreen({ state, fileName, isLocal }: ProcessingScreenProps) {
+export default function ProcessingScreen({ state, fileName, isLocal, onCancel }: ProcessingScreenProps) {
   const { steps, stepIndex, progress } = state;
   const overallPercent =
     progress != null ? Math.round(Math.max(0, Math.min(1, progress)) * 100) : null;
@@ -81,6 +82,18 @@ export default function ProcessingScreen({ state, fileName, isLocal }: Processin
           );
         })}
       </ol>
+
+      {onCancel && (
+        <div className="mt-7 flex justify-center">
+          <button
+            onClick={onCancel}
+            className="focus-ring inline-flex items-center gap-1.5 text-sm text-white/45 hover:text-white/80 transition-colors"
+          >
+            <X size={14} />
+            Cancel
+          </button>
+        </div>
+      )}
     </div>
   );
 }
