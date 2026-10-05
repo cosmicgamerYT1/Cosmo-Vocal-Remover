@@ -141,8 +141,137 @@ function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<
 const EXTRACT_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
 const MUX_TIMEOUT_MS = 6 * 60 * 1000; // 6 minutes (re-encode fallback can be slow)
 
-/** Extracts the audio track from a video file as WAV bytes, for decoding/separation. */
+/**
+ * Extracts the audio track from a video file.
+ *
+ * We first try the browser's native media pipeline. This is intentionally the
+ * default for MP4/WebM/MOV files because it does not copy the entire video
+ * into FFmpeg's in-memory filesystem. The audio is recorded through a
+ * MediaElementAudioSourceNode into a MediaRecorder, so memory usage stays
+ * proportional to the compressed audio chunks rather than the size of the
+ * source video.
+ *
+ * If the browser cannot decode/capture the source (notably some MKV/codecs),
+ * we fall back to FFmpeg WASM.
+ */
 export async function extractAudioFromVideo(
+  file: File,
+  onProgress?: (ratio: number) => void
+): Promise<Uint8Array> {
+  try {
+    return await extractAudioWithBrowser(file, onProgress);
+  } catch (nativeError) {
+    console.debug("[vocal-remover] Native video audio extraction unavailable; falling back to FFmpeg.", nativeError);
+    return extractAudioWithFFmpeg(file, onProgress);
+  }
+}
+
+async function extractAudioWithBrowser(
+  file: File,
+  onProgress?: (ratio: number) => void
+): Promise<Uint8Array> {
+  if (typeof window === "undefined" || typeof MediaRecorder === "undefined") {
+    throw new Error("Browser audio recording is unavailable.");
+  }
+
+  const video = document.createElement("video");
+  const objectURL = URL.createObjectURL(file);
+  let audioContext: AudioContext | null = null;
+  let source: MediaElementAudioSourceNode | null = null;
+  let destination: MediaStreamAudioDestinationNode | null = null;
+  let recorder: MediaRecorder | null = null;
+
+  try {
+    video.preload = "auto";
+    video.playsInline = true;
+    video.volume = 0;
+    video.src = objectURL;
+
+    await waitForVideoMetadata(video);
+
+    const AudioContextCtor =
+      (window.AudioContext || (window as any).webkitAudioContext) as typeof AudioContext;
+    if (!AudioContextCtor) throw new Error("Web Audio API unavailable.");
+
+    audioContext = new AudioContextCtor();
+    if (audioContext.state === "suspended") await audioContext.resume();
+
+    source = audioContext.createMediaElementSource(video);
+    destination = audioContext.createMediaStreamDestination();
+    source.connect(destination);
+
+    const mimeType = chooseRecordingMimeType();
+    recorder = mimeType
+      ? new MediaRecorder(destination.stream, { mimeType, audioBitsPerSecond: 192000 })
+      : new MediaRecorder(destination.stream);
+
+    const chunks: Blob[] = [];
+    const recording = new Promise<Blob>((resolve, reject) => {
+      recorder!.ondataavailable = (event) => {
+        if (event.data.size > 0) chunks.push(event.data);
+      };
+      recorder!.onerror = () => reject(new Error("The browser failed while recording the extracted audio."));
+      recorder!.onstop = () => resolve(new Blob(chunks, { type: recorder!.mimeType || "audio/webm" }));
+    });
+
+    const progressTimer = window.setInterval(() => {
+      if (video.duration > 0 && Number.isFinite(video.duration)) {
+        onProgress?.(Math.max(0, Math.min(1, video.currentTime / video.duration)));
+      }
+    }, 250);
+
+    const ended = new Promise<void>((resolve, reject) => {
+      video.onended = () => resolve();
+      video.onerror = () => reject(new Error("The browser could not decode this video's audio track."));
+    });
+
+    recorder.start(1000);
+    try {
+      await video.play();
+      await ended;
+    } finally {
+      window.clearInterval(progressTimer);
+      if (recorder.state !== "inactive") recorder.stop();
+    }
+
+    const blob = await recording;
+    if (blob.size === 0) throw new Error("No audio track was produced by the browser.");
+
+    onProgress?.(1);
+    return new Uint8Array(await blob.arrayBuffer());
+  } finally {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+    source?.disconnect();
+    destination?.disconnect();
+    await audioContext?.close().catch(() => {});
+    URL.revokeObjectURL(objectURL);
+  }
+}
+
+function chooseRecordingMimeType(): string | undefined {
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/ogg",
+  ];
+  return candidates.find((type) => MediaRecorder.isTypeSupported(type));
+}
+
+function waitForVideoMetadata(video: HTMLVideoElement): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      resolve();
+      return;
+    }
+    video.onloadedmetadata = () => resolve();
+    video.onerror = () => reject(new Error("The browser could not read the video's metadata."));
+  });
+}
+
+async function extractAudioWithFFmpeg(
   file: File,
   onProgress?: (ratio: number) => void
 ): Promise<Uint8Array> {
@@ -155,13 +284,19 @@ export async function extractAudioFromVideo(
   if (onProgress) ffmpeg.on("progress", progressHandler);
 
   try {
+    // FFmpeg WASM requires the input to be present in its virtual filesystem.
+    // The native path above is therefore important for large browser-friendly
+    // videos; this remains the compatibility fallback for formats/codecs the
+    // browser cannot decode itself.
+    onProgress?.(0);
     await ffmpeg.writeFile(inputName, await fetchFile(file));
     await withTimeout(
-      ffmpeg.exec(["-i", inputName, "-vn", "-acodec", "pcm_s16le", "-ar", "44100", outputName]),
+      ffmpeg.exec(["-i", inputName, "-vn", "-sn", "-dn", "-acodec", "pcm_s16le", "-ar", "44100", outputName]),
       EXTRACT_TIMEOUT_MS,
       "Extracting audio from the video"
     );
     const data = await ffmpeg.readFile(outputName);
+    onProgress?.(1);
     return data as Uint8Array;
   } finally {
     if (onProgress) ffmpeg.off("progress", progressHandler);
